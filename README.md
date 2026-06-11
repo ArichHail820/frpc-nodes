@@ -87,3 +87,95 @@ curl -x socks5h://127.0.0.1:1080 https://api.ipify.org
 - **费用**:19 个并行 runner + 5 分钟一轮,Actions 分钟数消耗快。私有仓库会很快吃光免费额度,**建议放公开仓库**(Actions 免费不限量),但公开仓库绝不能把密钥写进代码,全部放 Secrets。
 - **换批瞬间**:可能有极少数请求落到刚退出的节点上失败,客户端侧做重试即可(`round-robin` 只用当前在线节点,不会整体中断)。
 - 长时间占用 runner 跑代理属灰色用法,可能触发 GitHub 滥用检测,自行评估。
+
+
+---
+
+# gost 版(relay+quic,取代 frpc)
+
+frp 是 TCP-over-TCP,会把 TLS ClientHello 拆段,被 Akamai 这类风控识别(实测同一出口 IP,frp 路径被挡、hy2 能过)。gost 版把服务器↔节点这段换成 **relay+quic**,并在节点本地起 socks5 直连出网,规避拆段问题。工作流文件:`.github/workflows/gost-node.yml`。
+
+## 链路
+
+```
+客户端 --hy2--> 服务器 mihomo --(127.0.0.1:200xx)--> gost relay --quic--> GHA节点 gost(socks5) --> 目标
+                                          ↑ 取代 frps            ↑ 取代 frpc
+```
+
+mihomo 完全不动(仍连 `127.0.0.1:20001..60`),只换穿透层。
+
+## 部署步骤
+
+### 1. 服务器装 gost relay(取代 frps)
+
+```bash
+cd ../server   # frp-hy2-pool/server
+sudo TOKEN=你的强口令 RELAY_PORT=8443 bash install_server_gost.sh
+# 防火墙放行 8443/udp
+```
+
+脚本会停掉旧 frps、起 gost relay(`relay+quic://:8443?bind=true`),mihomo 不动。
+
+### 2. 先用单节点验证能不能过 Akamai(别急着开 19 个 runner)
+
+随便找台机器(本地/VPS)当节点,**用配置文件**(CLI 的 `rtcp://:端口/...` 紧凑写法会把绑定地址拼成 `0.0.0.0::端口` 非法地址,bind 必失败):
+
+```bash
+mkdir -p /etc/gost
+cat > /etc/gost/node.yaml <<'EOF'
+services:
+- name: socks
+  addr: "127.0.0.1:1080"
+  handler: { type: socks5 }
+  listener: { type: tcp }
+- name: reverse
+  addr: "127.0.0.1:20051"        # 在服务器上绑定的地址(loopback,给 mihomo 用)
+  handler: { type: rtcp }
+  listener: { type: rtcp, chain: relay }
+  forwarder:
+    nodes:
+    - { name: socks-local, addr: "127.0.0.1:1080" }
+chains:
+- name: relay
+  hops:
+  - name: hop
+    nodes:
+    - name: server
+      addr: "服务器IP:8443"
+      connector:
+        type: relay
+        auth: { username: node, password: 你的强口令 }
+      dialer: { type: quic }
+EOF
+gost -C /etc/gost/node.yaml
+```
+
+看到 `bind on 127.0.0.1:20051/tcp OK` 就成了。
+
+在服务器上测出口和指纹:
+
+```bash
+curl -x socks5h://127.0.0.1:7890 https://api.ipify.org           # 应返回节点 IP
+curl -x socks5h://127.0.0.1:7890 -s -o /dev/null -w "%{http_code}\n" \
+  "https://tools.usps.com/go/TrackConfirmAction?tLabels=9400111899223818218407"
+```
+
+- **USPS 返回 200/302** → gost 路径过了,继续第 3 步上 GHA。
+- **仍被挡** → 说明拆段不是唯一原因(可能 socks 出口仍拆 ClientHello),先别铺开,回来一起看抓包。
+
+### 3. 配置 GHA 并启动
+
+仓库 Secrets:
+
+| Secret | 值 |
+|---|---|
+| `FRP_SERVER_ADDR` | 服务器公网 IP(复用) |
+| `GOST_TOKEN` | 与服务器 `install_server_gost.sh` 的 `TOKEN` 一致 |
+| `PAT` | 有 `repo`+`workflow` 权限的 PAT(复用) |
+
+Actions → "gost exit nodes" → Run workflow。
+
+## 注意
+
+- `relay+quic` 节点侧默认跳过证书校验(连服务器自签证书)。若日志报 TLS/证书错误,在 `-F` 末尾加 `&secure=false`。
+- gost 换的是"服务器↔节点"传输;**节点到目标那一跳仍是节点本地 socks5 新建的 TCP**。能不能彻底解决拆段,以第 2 步单节点实测为准——这就是为什么要先验证再铺开。
